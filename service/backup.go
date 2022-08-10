@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	//"net/smtp"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/swisscom/backman/config"
@@ -54,8 +56,62 @@ type File struct {
 // swagger:response backups
 type Backups []Backup
 
+// START CUSTOMIZING - Add function for single index backup --------------------------------------
+func (s *Service) BackupSingle(service util.Service, index string) error {
+	filename := fmt.Sprintf("%s_BACKUPTIME-%s.gz", index, time.Now().Format("20060102150405"))
+
+	envService, err := s.App.Services.WithName(service.Name)
+	if err != nil {
+		log.Errorf("could not find service [%s] to backup: %v", service.Name, err)
+		return err
+	}
+
+	// ctx to abort backup if this takes longer than defined timeout
+	ctx, cancel := context.WithTimeout(context.Background(), service.Timeout)
+	defer cancel()
+
+	switch service.Type() {
+	case util.MongoDB:
+		err = mongodb.Backup(ctx, s.S3, service, envService, filename)
+	case util.Redis:
+		err = redis.Backup(ctx, s.S3, service, envService, filename)
+	case util.MySQL:
+		err = mysql.Backup(ctx, s.S3, service, envService, filename)
+	case util.Postgres:
+		err = postgres.Backup(ctx, s.S3, service, envService, filename)
+	case util.Elasticsearch:
+		err = elasticsearch.BackupSingle(ctx, s.S3, service, envService, filename, index)
+	default:
+		err = fmt.Errorf("unsupported service type [%s]", service.Label)
+	}
+	if err != nil {
+		log.Errorf("could not backup service [%s]: %v", service.Name, err)
+		return err
+	}
+	log.Infof("created and uploaded backup [%s] for service [%s]", filename, service.Name)
+
+	// only run background goroutines if not in non-background mode
+	if !config.Get().Foreground {
+		// cleanup files according to retention policy of service
+		go func() {
+			if err := s.RetentionCleanup(service); err != nil {
+				log.Errorf("could not cleanup S3 storage for service [%s]: %v", service.Name, err)
+			}
+
+			// update backup files state & metrics
+			_, _ = s.GetBackups(service.Label, service.Name)
+		}()
+	}
+	return err
+}
+
+// STOP CUSTOMIZING -----------------------------------------------------------------------------
+
 func (s *Service) Backup(service util.Service) error {
-	filename := fmt.Sprintf("%s_%s.gz", service.Name, time.Now().Format("20060102150405"))
+	// START CUSTOMIZING - Change filename for the backup file --------------------------------------
+	//filename := fmt.Sprintf("%s_Index-%s_Backuptime-%s.gz", service.Name, time.Now().Add(-24*time.Hour).Format("20060102"), time.Now().Format("20060102150405"))
+	filename := fmt.Sprintf("index-esc-x-%s-%02d_BACKUPTIME-%s.gz", time.Now().Add(-24*time.Hour).Format("2006.01.02"), time.Now().Hour(), time.Now().Format("20060102150405"))
+	// STOP CUSTOMIZING -----------------------------------------------------------------------------
 
 	envService, err := s.App.Services.WithName(service.Name)
 	if err != nil {
@@ -127,6 +183,20 @@ func (s *Service) GetBackups(serviceType, serviceName string) ([]Backup, error) 
 				})
 			}
 		}
+
+		// START CUSTOMIZING - Add monitoring function, which checks if all backups exists for the day before yesterday --------------------------------------
+		yesterday := time.Now().Add(-48 * time.Hour).Format("2006.01.02")
+		count := 0
+		for _, checkFiles := range files {
+			if strings.Contains(checkFiles.Filename, yesterday) {
+				count += 1
+			}
+		}
+		log.Infof("There are [%d] backup files for the day before yesterday [%s], if less than 24 we send a notification mail", count, yesterday)
+		if count < 24 {
+			log.Errorf("There are only %d backup files for %s, but there should be 24 files (one for each hour). Please check which files are missing and create a manual backup for them.", count, yesterday)
+		}
+		// STOP CUSTOMIZING -----------------------------------------------------------------------------
 
 		// sort order of backup files, newest file first
 		sort.Slice(files, func(i, j int) bool {

@@ -33,9 +33,48 @@ func main() {
 
 func runNow() bool {
 	serviceToBackup := flag.String("backup", "", "service to backup now")
+	// START CUSTOMIZING - Add function for dedicated index backup --------------------------------------
+	serviceToBackupSingle := flag.String("backupdedicated", "", "service to backup now")
+	indexToBackup := flag.String("index", "", "index to use for backup restore")
+	// STOP CUSTOMIZING -----------------------------------------------------------------------------
 	serviceToRestore := flag.String("restore", "", "service to restore now")
 	filenameToRestore := flag.String("filename", "", "filename to use for service restore")
 	flag.Parse()
+
+	// START CUSTOMIZING - Add function for single index backup --------------------------------------
+        // check if backup for single index should run
+        if len(*serviceToBackupSingle) > 0 && len(*indexToBackup) > 0 {
+                log.Infof("backup for dedicated index flag provided with value [%s/%s], running backup now", *serviceToBackupSingle, *indexToBackup)
+
+                // setting config to non-background mode, to avoid background goroutines during backups
+                config.Get().Foreground = true
+
+                // find service to backup
+                var found bool
+                for _, s := range service.Get().Services {
+                        if s.Name == *serviceToBackupSingle {
+                                // running backup
+                                log.Infof("running service backup for [%s/%s/%s]", s.Label, s.Name, *indexToBackup)
+                                if err := service.Get().BackupSingle(s, *indexToBackup); err != nil {
+                                        log.Fatalf("service backup failed: %v", err)
+                                }
+                                found = true
+
+                                // running S3 cleanup
+                                if err := service.Get().RetentionCleanup(s); err != nil {
+                                        log.Errorf("could not cleanup S3 storage for service [%s]: %v", s.Name, err)
+                                }
+                                break
+                        }
+                }
+                if !found {
+                        log.Fatalf("could not find any service named [%s]", *serviceToBackupSingle)
+                }
+
+                log.Infoln("backup successfully completed")
+                return true
+        }
+	// STOP CUSTOMIZING -----------------------------------------------------------------------------
 
 	// check if backup should run
 	if len(*serviceToBackup) > 0 {
