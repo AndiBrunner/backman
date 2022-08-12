@@ -108,10 +108,7 @@ func (s *Service) BackupSingle(service util.Service, index string) error {
 // STOP CUSTOMIZING -----------------------------------------------------------------------------
 
 func (s *Service) Backup(service util.Service) error {
-	// START CUSTOMIZING - Change filename for the backup file --------------------------------------
-	//filename := fmt.Sprintf("%s_Index-%s_Backuptime-%s.gz", service.Name, time.Now().Add(-24*time.Hour).Format("20060102"), time.Now().Format("20060102150405"))
-	filename := fmt.Sprintf("index-esc-x-%s-%02d_BACKUPTIME-%s.gz", time.Now().Add(-24*time.Hour).Format("2006.01.02"), time.Now().Hour(), time.Now().Format("20060102150405"))
-	// STOP CUSTOMIZING -----------------------------------------------------------------------------
+	filename := fmt.Sprintf("%s_%s.gz", service.Name, time.Now().Format("20060102150405"))
 
 	envService, err := s.App.Services.WithName(service.Name)
 	if err != nil {

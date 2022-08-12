@@ -15,6 +15,8 @@ var (
 	once   sync.Once
 )
 
+// START CUSTOMIZING - Added Config for Backup Clearer  -----------------------------------------
+
 type Config struct {
 	LogLevel           string `json:"log_level"`
 	LoggingTimestamp   bool   `json:"logging_timestamp"`
@@ -26,7 +28,22 @@ type Config struct {
 	S3                 S3Config
 	Services           map[string]ServiceConfig
 	Foreground         bool
+	BackupCleaner      BackupCleaner `json:"backup_cleaner"`
 }
+
+type BackupCleaner struct {
+	Enabled            bool   `json:"enabled"`
+	DefaultEndHours    int    `json:"default_end_hours"`
+	DefaultStartHours  int    `json:"default_start_hours"`
+	OutdatedEndHours   int    `json:"outdated_end_hours"`
+	OutdatedStartHours int    `json:"outdated_start_hours"`
+	Group              string `json:"group"`
+	Type               string `json:"type"`
+	Instance           string `json:"instance"`
+	EsDateHourPattern  string `json:"es_datehour_pattern"`
+}
+
+// STOP CUSTOMIZING -----------------------------------------------------------------------------
 
 type S3Config struct {
 	DisableSSL    bool   `json:"disable_ssl"`
@@ -160,6 +177,36 @@ func Get() *Config {
 				}
 				config.Services[serviceName] = mergedServiceConfig
 			}
+
+			// START CUSTOMIZING - Added Config for Backup Clearer  -----------------------------------------
+			if envConfig.BackupCleaner.Enabled {
+				config.BackupCleaner.Enabled = envConfig.BackupCleaner.Enabled
+			}
+			if envConfig.BackupCleaner.DefaultStartHours > 0 {
+				config.BackupCleaner.DefaultStartHours = envConfig.BackupCleaner.DefaultStartHours
+			}
+			if envConfig.BackupCleaner.DefaultEndHours > 0 {
+				config.BackupCleaner.DefaultEndHours = envConfig.BackupCleaner.DefaultEndHours
+			}
+			if envConfig.BackupCleaner.OutdatedStartHours > 0 {
+				config.BackupCleaner.OutdatedStartHours = envConfig.BackupCleaner.OutdatedStartHours
+			}
+			if envConfig.BackupCleaner.OutdatedEndHours > 0 {
+				config.BackupCleaner.OutdatedEndHours = envConfig.BackupCleaner.OutdatedEndHours
+			}
+			if len(envConfig.BackupCleaner.Group) > 0 {
+				config.BackupCleaner.Group = envConfig.BackupCleaner.Group
+			}
+			if len(envConfig.BackupCleaner.Type) > 0 {
+				config.BackupCleaner.Type = envConfig.BackupCleaner.Type
+			}
+			if len(envConfig.BackupCleaner.Instance) > 0 {
+				config.BackupCleaner.Instance = envConfig.BackupCleaner.Instance
+			}
+			if len(envConfig.BackupCleaner.EsDateHourPattern) > 0 {
+				config.BackupCleaner.EsDateHourPattern = envConfig.BackupCleaner.EsDateHourPattern
+			}
+			// STOP CUSTOMIZING -----------------------------------------------------------------------------
 		}
 
 		// ensure we have default values
@@ -169,6 +216,18 @@ func Get() *Config {
 		if len(config.S3.ServiceLabel) == 0 {
 			config.S3.ServiceLabel = "dynstrg"
 		}
+
+		// START CUSTOMIZING - Added Config for Backup Clearer  -----------------------------------------
+		if len(config.BackupCleaner.Group) == 0 {
+			config.BackupCleaner.Enabled = false
+		}
+		if len(config.BackupCleaner.Type) == 0 {
+			config.BackupCleaner.Enabled = false
+		}
+		if len(config.BackupCleaner.Instance) == 0 {
+			config.BackupCleaner.Enabled = false
+		}
+		// STOP CUSTOMIZING -----------------------------------------------------------------------------
 
 		// use username & password from env if defined
 		if len(os.Getenv("BACKMAN_USERNAME")) > 0 {

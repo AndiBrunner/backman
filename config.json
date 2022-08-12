@@ -31,5 +31,16 @@
 				"files": 500
 			}
 		}
+	},
+	"backup_cleaner": {
+		"enabled": false,
+		"default_end_hours": 30,
+		"default_start_hours": 240,
+		"outdated_end_hours": 48,
+		"outdated_start_hours": 300,
+		"group": "running",
+		"type": "",
+		"instance": "1",
+		"es_datehour_pattern": "^.*$"
 	}
 }

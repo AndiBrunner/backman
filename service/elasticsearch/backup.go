@@ -5,10 +5,17 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"github.com/swisscom/backman/config"
 	"io"
+	"net/http"
 	"net/url"
 	"os/exec"
+	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -45,14 +52,153 @@ func Backup(ctx context.Context, s3 *s3.Client, service util.Service, binding *c
 	connectstring := fmt.Sprintf("%s://%s:%s@%s", u.Scheme, username, password, u.Host)
 
 	// START CUSTOMIZING - Only dump the indexes from yesterday -------------------------------------
-	yesterdaydate := time.Now().Add(-24 * time.Hour).Format("2006.01.02")
+	backupCleaner := config.Get().BackupCleaner
+
+	referenceTime := time.Now()
+	outdatedEndTime := referenceTime.Add(time.Duration(backupCleaner.OutdatedEndHours*-1) * time.Hour)
+	outdatedStartTime := referenceTime.Add(time.Duration(backupCleaner.OutdatedStartHours*-1) * time.Hour)
+	referenceTimestamp := referenceTime.Format("20060102150405")
+	yesterdayDateHour := referenceTime.Add(-24 * time.Hour).Format("2006.01.02-15")
+	filename = fmt.Sprintf("index-esc-x-%s_BACKUPTIME-%s.gz", yesterdayDateHour, referenceTimestamp)
+
+	if backupCleaner.Enabled {
+		if backupCleaner.Type == "cleaner" {
+			//get regular dates in regular files
+			endDateHour := referenceTime
+			objectPath := fmt.Sprintf("%s/%s/%s/regular-", service.Label, service.Name, backupCleaner.Group)
+			objects, err := s3.List(objectPath)
+			if err != nil {
+				log.Warnf("backup cleaner - could not list S3 regular objects: %v", err)
+			}
+			// eval min date of all regular files
+			for _, obj := range objects {
+				tempDateHour := GetCleanerDate(s3, obj.Key, referenceTime)
+				if tempDateHour.Before(endDateHour) && tempDateHour.After(outdatedEndTime) {
+					endDateHour = tempDateHour
+				}
+			}
+			// set default end date
+			if endDateHour.Equal(referenceTime) {
+				endDateHour = referenceTime.Add(time.Duration(backupCleaner.DefaultEndHours*-1) * time.Hour)
+			}
+
+			// eval start date
+			startDateHour := referenceTime
+			objectPath = fmt.Sprintf("%s/%s/%s/%s-%s", service.Label, service.Name, backupCleaner.Group, backupCleaner.Type, backupCleaner.Instance)
+			tempDateHour := GetCleanerDate(s3, objectPath, referenceTime)
+			if tempDateHour.After(outdatedStartTime) {
+				startDateHour = tempDateHour
+			}
+
+			// set default start date
+			if startDateHour.Equal(referenceTime) {
+				startDateHour = referenceTime.Add(time.Duration(backupCleaner.DefaultStartHours*-1) * time.Hour)
+			}
+
+			// Loop per day and searching for first gap
+			workingDateHour := startDateHour
+			gapFound := false
+			endReached := false
+			maxLoops := 1000
+			for i := 0; i < maxLoops && !gapFound && !endReached; i++ {
+				workingDateDayString := workingDateHour.Format("2006.01.02")
+
+				//get ES list of current day
+				url := fmt.Sprintf("%s/index-esc-*-%s-*", host, workingDateDayString)
+				indexes, err := GetIndexes(url, username, password)
+				if err != nil {
+					log.Errorf("backup cleaner - could not list ES indexes : %v", err)
+					return err
+				}
+
+				// get S3 list of current day
+				m := make(map[string]string)
+				objectPath = fmt.Sprintf("%s/%s/index-esc-x-%s", service.Label, service.Name, workingDateDayString)
+				objects, err = s3.List(objectPath)
+				if err != nil {
+					log.Errorf("backup cleaner - could not list S3 backup objects: %v", err)
+					return err
+				}
+
+				// check all S3 entries and store them in a map
+				for _, obj := range objects {
+					objFilename := filepath.Base(obj.Key)
+					dateHourString := objFilename[12:25]
+					_, err := time.Parse("2006.01.02-15", dateHourString)
+					if err == nil {
+						m[dateHourString] = objFilename
+					}
+				}
+
+				// search gap
+				newStartDateHour := startDateHour
+				for _, dateHourString := range indexes {
+					dateHour, err := time.Parse("2006.01.02-15", dateHourString)
+					if err != nil {
+						log.Errorf("backup cleaner - could not parse index date : %v", err)
+						return err
+					}
+					// stop searching if end date is reached
+					if !endDateHour.After(dateHour) {
+						endReached = true
+						break
+					}
+
+					// check ES date pattern
+					dateHourString := "2000.02.13-33"
+					pattern := ".*"
+					if backupCleaner.EsDateHourPattern != "" {
+						pattern = backupCleaner.EsDateHourPattern
+					}
+					match, _ := regexp.MatchString(pattern, dateHourString)
+
+					if !match {
+						continue
+					}
+
+					//search for gap when current date is after or equal start date
+					if !startDateHour.After(dateHour) {
+						newStartDateHour = dateHour
+						if _, s3found := m[dateHourString]; !s3found {
+							log.Infof("backup cleaner - gap found at: %s", dateHourString)
+							gapFound = true
+							// adapt filename
+							filename = fmt.Sprintf("index-esc-x-%s_BACKUPTIME-%s.gz", dateHourString, referenceTimestamp)
+							break
+						}
+					}
+				}
+				// write current cleaner dateHour to S3 as the new starting date
+				if newStartDateHour.After(startDateHour) {
+					newStartDateHourString := newStartDateHour.Format("2006.01.02")
+					objectPath := fmt.Sprintf("%s/%s/%s/%s-%s", service.Label, service.Name, backupCleaner.Group, backupCleaner.Type, backupCleaner.Instance)
+					r := strings.NewReader(newStartDateHourString)
+					err = s3.Upload(objectPath, r, -1)
+					if err != nil {
+						log.Warnf("backup cleaner - could not upload current cleaner backup state to S3: %v", err)
+					}
+				}
+				workingDateHour = workingDateHour.Add(24 * time.Hour)
+			}
+
+		}
+
+		if backupCleaner.Type == "regular" {
+			objectPath := fmt.Sprintf("%s/%s/%s/%s-%s", service.Label, service.Name, backupCleaner.Group, backupCleaner.Type, backupCleaner.Instance)
+			r := strings.NewReader(yesterdayDateHour)
+			err := s3.Upload(objectPath, r, -1)
+			if err != nil {
+				log.Warnf("backup cleaner - could not upload current regular backup state to S3: %v", err)
+			}
+		}
+	}
 	// STOP CUSTOMIZING -----------------------------------------------------------------------------
 
 	// prepare elasticdump command
 	var command []string
 	command = append(command, "elasticdump")
 	// START CUSTOMIZING - Only dump the indexes from yesterday -------------------------------------
-	command = append(command, fmt.Sprintf("--input=%s/index-esc-*-%s-%02d", connectstring, yesterdaydate, time.Now().Hour()))
+	command = append(command, fmt.Sprintf("--input=%s/index-esc-*-%s", connectstring, yesterdayDateHour))
 	// command = append(command, fmt.Sprintf("--input=%s", connectstring))
 	// STOP CUSTOMIZING -----------------------------------------------------------------------------
 	command = append(command, "--output=$")
@@ -237,6 +383,62 @@ func BackupSingle(ctx context.Context, s3 *s3.Client, service util.Service, bind
 		state.BackupSuccess(service)
 	}
 	return err
+}
+
+func GetCleanerDate(s3 *s3.Client, filename string, defaultDate time.Time) time.Time {
+	r, err := s3.Download(filename)
+	if err != nil {
+		return defaultDate
+	}
+
+	buf := new(strings.Builder)
+	_, err = io.Copy(buf, r)
+	if err != nil {
+		return defaultDate
+	}
+
+	dateHourString := buf.String()
+	dateHour, err := time.Parse("2006.01.02-15", dateHourString)
+	if err != nil {
+		return defaultDate
+	}
+	return dateHour
+}
+
+func GetIndexes(url string, username string, password string) ([]string, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return []string{}, err
+	}
+
+	req.SetBasicAuth(username, password)
+	cli := &http.Client{}
+
+	response, err := cli.Do(req)
+	if response != nil {
+		defer response.Body.Close()
+	}
+
+	if err != nil {
+		return []string{}, err
+	}
+
+	if response.StatusCode != 200 {
+		return []string{}, errors.New("Request failed with status: " + response.Status)
+	}
+
+	//decode json
+	var indexes map[string]string
+	err = json.NewDecoder(response.Body).Decode(&indexes)
+	if err != nil {
+		return []string{}, err
+	}
+
+	//sort
+	keys := make([]string, 0, len(indexes))
+	sort.Strings(keys)
+
+	return keys, nil
 }
 
 // STOP CUSTOMIZING -----------------------------------------------------------------------------
