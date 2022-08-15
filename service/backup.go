@@ -120,6 +120,8 @@ func (s *Service) Backup(service util.Service) error {
 	ctx, cancel := context.WithTimeout(context.Background(), service.Timeout)
 	defer cancel()
 
+	// START CUSTOMIZING - Handle Cleaner Backup ------------------------------------------------------
+	cleanerEndReached := false
 	switch service.Type() {
 	case util.MongoDB:
 		err = mongodb.Backup(ctx, s.S3, service, envService, filename)
@@ -130,7 +132,7 @@ func (s *Service) Backup(service util.Service) error {
 	case util.Postgres:
 		err = postgres.Backup(ctx, s.S3, service, envService, filename)
 	case util.Elasticsearch:
-		err = elasticsearch.Backup(ctx, s.S3, service, envService, filename)
+		cleanerEndReached, filename, err = elasticsearch.Backup(ctx, s.S3, service, envService, filename)
 	default:
 		err = fmt.Errorf("unsupported service type [%s]", service.Label)
 	}
@@ -138,7 +140,12 @@ func (s *Service) Backup(service util.Service) error {
 		log.Errorf("could not backup service [%s]: %v", service.Name, err)
 		return err
 	}
-	log.Infof("created and uploaded backup [%s] for service [%s]", filename, service.Name)
+
+	if !cleanerEndReached {
+		log.Infof("created and uploaded backup [%s] for service [%s]", filename, service.Name)
+	}
+
+	// STOP CUSTOMIZING -----------------------------------------------------------------------------
 
 	// only run background goroutines if not in non-background mode
 	if !config.Get().Foreground {

@@ -1,0 +1,65 @@
+---
+# See manifest.yml documentation available at:
+# https://docs.developer.swisscom.com/devguide/deploy-apps/manifest.html
+
+applications:
+- name: test-cleaner-01
+  memory: 1G # mysqldump consumes a lot of memory, no matter how small the database is
+  disk_quota: 1G
+  instances: 1
+  health-check-type: port
+
+  routes:
+  - route: test-cleaner-01.scapp-corp.swisscom.com
+
+  services:
+  - s3-test-cleaner
+  - d-elasticsearch-01
+  # - my_mysql_db
+  # - my_postgres_db
+  # - my_mongodb
+  # - my_elasticsearch
+  # - my_redis
+
+  # ### push either as docker image
+  #docker:
+  # image: jamesclonk/backman:1.20.1 # choose version from https://hub.docker.com/r/jamesclonk/backman/tags, or 'latest'
+  # ### or as buildpack/src
+  buildpacks:
+    - apt_buildpack
+    - nodejs_buildpack
+    - go_buildpack
+  command: backman
+  path: .
+
+  env:
+    TZ: Europe/Zurich
+    # BACKMAN_ENCRYPTION_KEY: "" # data-at-rest-encryption for backups stored on S3, optional, could also be configured in config.json or BACKMAN_CONFIG
+    BACKMAN_CONFIG: |
+      {
+        "log_level": "debug",
+        "disable_web": false,
+        "disable_metrics": false,
+        "unprotected_metrics": false,     
+        "s3": {
+          "service_label": "dynstrg-2",
+          "bucket_name": "backman"
+        },
+        "services": {
+          "d-elasticsearch-01": {
+            "schedule": "0 */5 * * * *",
+            "timeout": "12h"
+          }
+        },
+        "backup_cleaner": {
+            "enabled": true,
+            "default_end_hours": 30,
+            "default_start_hours": 240,
+            "outdated_end_hours": 48,
+            "outdated_start_hours": 300,
+            "group": "running",
+            "type": "cleaner",
+            "instance": "1",
+            "es_datehour_pattern": "^.*$"
+        }
+      }

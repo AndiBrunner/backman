@@ -29,7 +29,7 @@ import (
 
 var esMutex = &sync.Mutex{}
 
-func Backup(ctx context.Context, s3 *s3.Client, service util.Service, binding *cfenv.Service, filename string) error {
+func Backup(ctx context.Context, s3 *s3.Client, service util.Service, binding *cfenv.Service, filename string) (bool, string, error) {
 	state.BackupQueue(service)
 
 	// lock global elasticsearch mutex, only 1 backup/restore operation of this service-type is allowed to run in parallel
@@ -49,7 +49,10 @@ func Backup(ctx context.Context, s3 *s3.Client, service util.Service, binding *c
 	}
 
 	u, _ := url.Parse(host)
-	connectstring := fmt.Sprintf("%s://%s:%s@%s", u.Scheme, username, password, u.Host)
+
+	// START CUSTOMIZING - escape username and password-------------------------------------
+	connectstring := fmt.Sprintf("%s://%s:%s@%s", u.Scheme, url.QueryEscape(username), url.QueryEscape(password), u.Host)
+	// STOP CUSTOMIZING -----------------------------------------------------------------------------
 
 	// START CUSTOMIZING - Only dump the indexes from yesterday -------------------------------------
 	backupCleaner := config.Get().BackupCleaner
@@ -60,9 +63,14 @@ func Backup(ctx context.Context, s3 *s3.Client, service util.Service, binding *c
 	referenceTimestamp := referenceTime.Format("20060102150405")
 	yesterdayDateHour := referenceTime.Add(-24 * time.Hour).Format("2006.01.02-15")
 	filename = fmt.Sprintf("index-esc-x-%s_BACKUPTIME-%s.gz", yesterdayDateHour, referenceTimestamp)
+	indexDateHour := yesterdayDateHour
 
 	if backupCleaner.Enabled {
 		if backupCleaner.Type == "cleaner" {
+			gapFound := false
+			endReached := false
+			maxLoops := 1000
+
 			//get regular dates in regular files
 			endDateHour := referenceTime
 			objectPath := fmt.Sprintf("%s/%s/%s/regular-", service.Label, service.Name, backupCleaner.Group)
@@ -97,9 +105,6 @@ func Backup(ctx context.Context, s3 *s3.Client, service util.Service, binding *c
 
 			// Loop per day and searching for first gap
 			workingDateHour := startDateHour
-			gapFound := false
-			endReached := false
-			maxLoops := 1000
 			for i := 0; i < maxLoops && !gapFound && !endReached; i++ {
 				workingDateDayString := workingDateHour.Format("2006.01.02")
 
@@ -108,7 +113,7 @@ func Backup(ctx context.Context, s3 *s3.Client, service util.Service, binding *c
 				indexes, err := GetIndexes(url, username, password)
 				if err != nil {
 					log.Errorf("backup cleaner - could not list ES indexes : %v", err)
-					return err
+					return false, filename, err
 				}
 
 				// get S3 list of current day
@@ -117,7 +122,7 @@ func Backup(ctx context.Context, s3 *s3.Client, service util.Service, binding *c
 				objects, err = s3.List(objectPath)
 				if err != nil {
 					log.Errorf("backup cleaner - could not list S3 backup objects: %v", err)
-					return err
+					return false, filename, err
 				}
 
 				// check all S3 entries and store them in a map
@@ -136,7 +141,7 @@ func Backup(ctx context.Context, s3 *s3.Client, service util.Service, binding *c
 					dateHour, err := time.Parse("2006.01.02-15", dateHourString)
 					if err != nil {
 						log.Errorf("backup cleaner - could not parse index date : %v", err)
-						return err
+						return false, filename, err
 					}
 					// stop searching if end date is reached
 					if !endDateHour.After(dateHour) {
@@ -145,7 +150,6 @@ func Backup(ctx context.Context, s3 *s3.Client, service util.Service, binding *c
 					}
 
 					// check ES date pattern
-					dateHourString := "2000.02.13-33"
 					pattern := ".*"
 					if backupCleaner.EsDateHourPattern != "" {
 						pattern = backupCleaner.EsDateHourPattern
@@ -163,6 +167,7 @@ func Backup(ctx context.Context, s3 *s3.Client, service util.Service, binding *c
 							log.Infof("backup cleaner - gap found at: %s", dateHourString)
 							gapFound = true
 							// adapt filename
+							indexDateHour = dateHourString
 							filename = fmt.Sprintf("index-esc-x-%s_BACKUPTIME-%s.gz", dateHourString, referenceTimestamp)
 							break
 						}
@@ -170,7 +175,7 @@ func Backup(ctx context.Context, s3 *s3.Client, service util.Service, binding *c
 				}
 				// write current cleaner dateHour to S3 as the new starting date
 				if newStartDateHour.After(startDateHour) {
-					newStartDateHourString := newStartDateHour.Format("2006.01.02")
+					newStartDateHourString := newStartDateHour.Format("2006.01.02-15")
 					objectPath := fmt.Sprintf("%s/%s/%s/%s-%s", service.Label, service.Name, backupCleaner.Group, backupCleaner.Type, backupCleaner.Instance)
 					r := strings.NewReader(newStartDateHourString)
 					err = s3.Upload(objectPath, r, -1)
@@ -181,24 +186,29 @@ func Backup(ctx context.Context, s3 *s3.Client, service util.Service, binding *c
 				workingDateHour = workingDateHour.Add(24 * time.Hour)
 			}
 
+			// do not backup
+			if endReached {
+				return true, filename, nil
+			}
 		}
 
 		if backupCleaner.Type == "regular" {
 			objectPath := fmt.Sprintf("%s/%s/%s/%s-%s", service.Label, service.Name, backupCleaner.Group, backupCleaner.Type, backupCleaner.Instance)
-			r := strings.NewReader(yesterdayDateHour)
+			r := strings.NewReader(indexDateHour)
 			err := s3.Upload(objectPath, r, -1)
 			if err != nil {
 				log.Warnf("backup cleaner - could not upload current regular backup state to S3: %v", err)
 			}
 		}
 	}
+
 	// STOP CUSTOMIZING -----------------------------------------------------------------------------
 
 	// prepare elasticdump command
 	var command []string
 	command = append(command, "elasticdump")
 	// START CUSTOMIZING - Only dump the indexes from yesterday -------------------------------------
-	command = append(command, fmt.Sprintf("--input=%s/index-esc-*-%s", connectstring, yesterdayDateHour))
+	command = append(command, fmt.Sprintf("--input=%s/index-esc-*-%s", connectstring, indexDateHour))
 	// command = append(command, fmt.Sprintf("--input=%s", connectstring))
 	// STOP CUSTOMIZING -----------------------------------------------------------------------------
 	command = append(command, "--output=$")
@@ -211,7 +221,7 @@ func Backup(ctx context.Context, s3 *s3.Client, service util.Service, binding *c
 	if err != nil {
 		log.Errorf("could not get stdout pipe for elasticdump: %v", err)
 		state.BackupFailure(service)
-		return err
+		return false, filename, err
 	}
 	defer outPipe.Close()
 
@@ -258,25 +268,25 @@ func Backup(ctx context.Context, s3 *s3.Client, service util.Service, binding *c
 	if err := cmd.Start(); err != nil {
 		log.Errorf("could not run elasticdump: %v", err)
 		state.BackupFailure(service)
-		return err
+		return false, filename, err
 	}
 
 	if err := cmd.Wait(); err != nil {
 		state.BackupFailure(service)
 		// check for timeout error
 		if ctx.Err() == context.DeadlineExceeded {
-			return fmt.Errorf("elasticdump: timeout: %v", ctx.Err())
+			return false, filename, fmt.Errorf("elasticdump: timeout: %v", ctx.Err())
 		}
 
 		log.Errorln(strings.TrimRight(errBuf.String(), "\r\n"))
-		return fmt.Errorf("elasticdump: %v", err)
+		return false, filename, fmt.Errorf("elasticdump: %v", err)
 	}
 
 	uploadWait.Wait() // wait for upload to have finished
 	if err == nil {
 		state.BackupSuccess(service)
 	}
-	return err
+	return false, filename, err
 }
 
 // START CUSTOMIZING - Add function for single index backup --------------------------------------
@@ -300,7 +310,7 @@ func BackupSingle(ctx context.Context, s3 *s3.Client, service util.Service, bind
 	}
 
 	u, _ := url.Parse(host)
-	connectstring := fmt.Sprintf("%s://%s:%s@%s", u.Scheme, username, password, u.Host)
+	connectstring := fmt.Sprintf("%s://%s:%s@%s", u.Scheme, url.QueryEscape(username), url.QueryEscape(password), u.Host)
 
 	// prepare elasticdump command
 	var command []string
@@ -428,7 +438,7 @@ func GetIndexes(url string, username string, password string) ([]string, error) 
 	}
 
 	//decode json
-	var indexes map[string]string
+	var indexes map[string]json.RawMessage
 	err = json.NewDecoder(response.Body).Decode(&indexes)
 	if err != nil {
 		return []string{}, err
@@ -436,6 +446,10 @@ func GetIndexes(url string, username string, password string) ([]string, error) 
 
 	//sort
 	keys := make([]string, 0, len(indexes))
+	for key := range indexes {
+		keyDate := strings.SplitN(key, "-", 4)
+		keys = append(keys, keyDate[3])
+	}
 	sort.Strings(keys)
 
 	return keys, nil
